@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
 
+
+
+
 /**
  * GET handler so the route never 405s if opened in a browser
  */
@@ -14,6 +17,18 @@ export async function GET() {
  * Extracts chemicals + lab operations from a pasted procedure
  */
 export async function POST(req: Request) {
+    const userAgent = req.headers.get("user-agent") || "";
+
+  // Ignore social media preview bots (LinkedIn, Facebook, Twitter)
+  if (/linkedinbot|facebookexternalhit|twitterbot/i.test(userAgent)) {
+    return new Response(
+      JSON.stringify({ ignored: true }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
   try {
     const body = await req.json();
     const procedure = String(body?.procedure || "").trim();
@@ -24,6 +39,8 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+
+    
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -189,4 +206,6 @@ export async function POST(req: Request) {
     );
   }
 }
+
+
 
