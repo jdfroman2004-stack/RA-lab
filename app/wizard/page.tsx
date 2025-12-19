@@ -1,12 +1,10 @@
-import { NextResponse } from "next/server";
+"use client";
 
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const cid = searchParams.get("cid") ?? "unknown";
-
-  return NextResponse.json({
-    ok: true,
-    cid,
-    message: "GHS endpoint is live",
-  });
+export default function Page() {
+  return (
+    <main style={{ padding: 24, fontFamily: "system-ui" }}>
+      <h1>Wizard page ✅</h1>
+      <p>If you can see this, the build/export issue is fixed.</p>
+    </main>
+  );
 }
