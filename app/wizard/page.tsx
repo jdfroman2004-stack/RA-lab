@@ -165,24 +165,27 @@ export default function WizardPage() {
   /* ------------------------- PubChem ------------------------- */
 
   async function findMatches(name: string) {
-    setError(null);
-    try {
-      const res = await fetch(`/api/chem/search?q=${encodeURIComponent(name)}`);
-      const data = await res.json().catch(() => ({}));
-      const matches: PubChemMatch[] = Array.isArray(data?.results) ? data.results : [];
+  setError(null);
+  try {
+    const res = await fetch(`/api/chem/search?q=${encodeURIComponent(name)}`);
+    const data = await res.json().catch(() => ({}));
 
-      setChemStates((prev) => ({
-        ...prev,
-        [name]: {
-          ...prev[name],
-          matches,
-          selectedCid: matches?.[0]?.cid ?? null,
-        },
-      }));
-    } catch (e: any) {
-      setError(e.message ?? "Match lookup failed");
-    }
+    // ✅ Your API returns { matches: [...] }
+    const matches: PubChemMatch[] = Array.isArray(data?.matches) ? data.matches : [];
+
+    setChemStates((prev) => ({
+      ...prev,
+      [name]: {
+        ...prev[name],
+        matches,
+        selectedCid: matches?.[0]?.cid ?? null,
+      },
+    }));
+  } catch (e: any) {
+    setError(e.message ?? "Match lookup failed");
   }
+}
+
 
   function confirmCid(name: string) {
     setChemStates((prev) => ({
