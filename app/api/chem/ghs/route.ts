@@ -19,72 +19,92 @@ function findSectionByHeading(node: AnyObj, heading: string): AnyObj | null {
   return null;
 }
 
-function collectStringsFromValue(v: AnyObj): string[] {
-  const out: string[] = [];
+/**
+ * Collects all strings AND all Markup URLs from a Value blob.
+ * PubChem often puts pictograms in Markup.URL rather than plain text.
+ */
+function collectStringsAndUrls(v: any): { strings: string[]; urls: string[] } {
+  const strings: string[] = [];
+  const urls: string[] = [];
 
-  // Common PubChem shapes:
-  // Value.StringWithMarkup -> [{String: "..."}]
-  // Value.String -> "..."
-  // Value.Table -> ...
-  if (!v || typeof v !== "object") return out;
+  const walk = (x: any) => {
+    if (!x || typeof x !== "object") return;
 
-  if (typeof v.String === "string") out.push(v.String);
+    if (typeof x.String === "string") strings.push(x.String);
 
-  const swm = v.StringWithMarkup;
-  if (Array.isArray(swm)) {
-    for (const item of swm) {
-      if (item?.String) out.push(String(item.String));
-    }
-  }
-
-  // Sometimes values are nested
-  for (const key of Object.keys(v)) {
-    const child = v[key];
-    if (child && typeof child === "object") {
-      if (Array.isArray(child)) {
-        for (const c of child) out.push(...collectStringsFromValue(c));
-      } else {
-        out.push(...collectStringsFromValue(child));
+    // Common PubChem shape: StringWithMarkup: [{ String, Markup: [{URL,...}] }]
+    if (Array.isArray(x.StringWithMarkup)) {
+      for (const item of x.StringWithMarkup) {
+        if (item?.String) strings.push(String(item.String));
+        if (Array.isArray(item?.Markup)) {
+          for (const m of item.Markup) {
+            if (m?.URL) urls.push(String(m.URL));
+            if (m?.Href) urls.push(String(m.Href));
+          }
+        }
       }
     }
-  }
 
-  return out.filter(Boolean);
+    // Some shapes have Markup directly
+    if (Array.isArray(x.Markup)) {
+      for (const m of x.Markup) {
+        if (m?.URL) urls.push(String(m.URL));
+        if (m?.Href) urls.push(String(m.Href));
+      }
+    }
+
+    // recurse everything
+    for (const key of Object.keys(x)) {
+      const child = x[key];
+      if (Array.isArray(child)) child.forEach(walk);
+      else if (child && typeof child === "object") walk(child);
+    }
+  };
+
+  walk(v);
+
+  // de-dupe
+  return {
+    strings: Array.from(new Set(strings.filter(Boolean))),
+    urls: Array.from(new Set(urls.filter(Boolean))),
+  };
 }
 
 /**
- * We use "named pictograms" so the UI can render consistently.
- * PubChem text sometimes includes: "GHS02 Flame", "GHS06 Skull and crossbones", etc.
+ * PubChem may give pictograms as:
+ * - text names ("Flame", "Corrosion")
+ * - GHS codes ("GHS02")
+ * - URLs that contain GHS codes ("...GHS02..." or "...ghs02...")
  */
 function normalizePictogramName(raw: string): string | null {
   const s = raw.toLowerCase();
 
-  if (s.includes("flame")) return "flame";
-  if (s.includes("skull")) return "skull";
-  if (s.includes("health hazard")) return "health_hazard";
-  if (s.includes("exclamation")) return "exclamation";
-  if (s.includes("environment")) return "environment";
-  if (s.includes("corrosion")) return "corrosion";
-  if (s.includes("gas cylinder")) return "gas_cylinder";
+  // map by text
+  if (s.includes("flame over circle") || s.includes("oxidizer")) return "oxidizer";
   if (s.includes("exploding bomb")) return "exploding_bomb";
-  if (s.includes("oxidizer") || s.includes("flame over circle")) return "oxidizer";
+  if (s.includes("gas cylinder")) return "gas_cylinder";
+  if (s.includes("corrosion")) return "corrosion";
+  if (s.includes("environment")) return "environment";
+  if (s.includes("exclamation")) return "exclamation";
+  if (s.includes("health hazard")) return "health_hazard";
+  if (s.includes("skull")) return "skull";
+  if (s.includes("flame")) return "flame";
 
-  // also map by GHS codes if present
-  if (s.includes("ghs02")) return "flame";
-  if (s.includes("ghs06")) return "skull";
-  if (s.includes("ghs08")) return "health_hazard";
-  if (s.includes("ghs07")) return "exclamation";
-  if (s.includes("ghs09")) return "environment";
-  if (s.includes("ghs05")) return "corrosion";
-  if (s.includes("ghs04")) return "gas_cylinder";
+  // map by GHS codes
   if (s.includes("ghs01")) return "exploding_bomb";
+  if (s.includes("ghs02")) return "flame";
   if (s.includes("ghs03")) return "oxidizer";
+  if (s.includes("ghs04")) return "gas_cylinder";
+  if (s.includes("ghs05")) return "corrosion";
+  if (s.includes("ghs06")) return "skull";
+  if (s.includes("ghs07")) return "exclamation";
+  if (s.includes("ghs08")) return "health_hazard";
+  if (s.includes("ghs09")) return "environment";
 
   return null;
 }
 
-// Simple “real-looking” diamonds (clean + professional).
-// These are not the official UNECE symbol art, but they render reliably and clearly.
+// Professional “diamond” placeholders (not UNECE official artwork, but clear & consistent)
 function pictogramSvg(name: string): string {
   const labelMap: Record<string, string> = {
     flame: "FLAME",
@@ -112,11 +132,8 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const cid = (url.searchParams.get("cid") || "").trim();
 
-    if (!cid) {
-      return NextResponse.json({ error: "Missing cid" }, { status: 400 });
-    }
+    if (!cid) return NextResponse.json({ error: "Missing cid" }, { status: 400 });
 
-    // PubChem PUG View (JSON) for compound record
     const pugViewUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${encodeURIComponent(
       cid
     )}/JSON`;
@@ -132,68 +149,93 @@ export async function GET(req: Request) {
     const data = await res.json();
     const record = data?.Record;
     if (!record) {
-      return NextResponse.json(
-        { error: "No Record in PUG View response" },
-        { status: 502 }
-      );
+      return NextResponse.json({ error: "No Record in PUG View response" }, { status: 502 });
     }
 
-    // Find "GHS Classification" section anywhere under Record.Section
+    // Find "GHS Classification" section
     const ghsSection = findSectionByHeading(record, "GHS Classification");
-    const info = Array.isArray(ghsSection?.Information)
-      ? ghsSection.Information
-      : [];
+    const info = Array.isArray(ghsSection?.Information) ? ghsSection.Information : [];
 
-    // Extract signal word, hazard statements, pictograms
     let signalWord: string | null = null;
     const hazardStatements: string[] = [];
     const pictograms: string[] = [];
 
     for (const item of info) {
       const name = String(item?.Name || "").toLowerCase();
-      const strings = collectStringsFromValue(item?.Value);
+      const { strings, urls } = collectStringsAndUrls(item?.Value);
 
+      // Signal word
       if (name.includes("signal")) {
-        // ex: "Danger" / "Warning"
         const sw = strings.find(Boolean);
         if (sw) signalWord = sw;
       }
 
+      // Hazard statements
       if (name.includes("hazard statement")) {
         for (const s of strings) {
-          // keep lines like "H225: Highly flammable liquid and vapour"
           if (s && /H\d{3}/i.test(s)) hazardStatements.push(s);
         }
       }
 
+      // Pictograms: extract from BOTH strings and URLs
       if (name.includes("pictogram")) {
         for (const s of strings) {
           const p = normalizePictogramName(s);
           if (p) pictograms.push(p);
         }
+        for (const u of urls) {
+          const p = normalizePictogramName(u);
+          if (p) pictograms.push(p);
+        }
+      }
+
+      // Extra safety: sometimes GHS codes appear in other value fields
+      // (so we scan all strings/urls lightly)
+      for (const s of strings) {
+        const p = normalizePictogramName(s);
+        if (p) pictograms.push(p);
+      }
+      for (const u of urls) {
+        const p = normalizePictogramName(u);
+        if (p) pictograms.push(p);
       }
     }
 
-    // Deduplicate
     const uniqPictos = Array.from(new Set(pictograms));
     const uniqHaz = Array.from(new Set(hazardStatements));
 
-    const pictogramSvgs: Record<string, string> = {};
-    for (const p of uniqPictos) pictogramSvgs[p] = pictogramSvg(p);
+    const fileMap: Record<string, string> = {
+  exploding_bomb: "exploding_bomb",
+  gas_cylinder: "gas_cylinder",
+  health_hazard: "health_hazard",
+  flame: "flame",
+  skull: "skull",
+  environment: "environment",
+  corrosion: "corrosion",
+  oxidizer: "oxidizer",
+  exclamation: "exclamation",
+};
 
-    return NextResponse.json({
-      cid,
-      signalWord: signalWord || null,
-      pictograms: uniqPictos,
-      pictogramSvgs,
-      hazardStatements: uniqHaz,
-      source: `https://pubchem.ncbi.nlm.nih.gov/compound/${cid}#section=GHS-Classification`,
-      _routeVersion: "ghs-live",
-    });
+
+    const pictogramUrls: Record<string, string> = {};
+for (const p of uniqPictos) {
+  pictogramUrls[p] = `/ghs/${fileMap[p] ?? p}.svg`;
+
+
+}
+
+return NextResponse.json({
+  cid: Number(cid),
+  signalWord: signalWord || null,
+  pictograms: uniqPictos,
+  pictogramUrls,
+  hazardStatements: uniqHaz,
+  source: `https://pubchem.ncbi.nlm.nih.gov/compound/${cid}#section=GHS-Classification`,
+  _routeVersion: "ghs-live-v3",
+});
+
+
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message || "GHS failed" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message || "GHS failed" }, { status: 500 });
   }
 }

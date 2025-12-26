@@ -34,9 +34,12 @@ type GhsData = {
   cid: number;
   signalWord: string | null;
   pictograms: string[];
+  pictogramUrls?: Record<string, string>;
   hazardStatements: string[];
   source: string;
 };
+
+
 
 /* ------------------------- Helper functions ----------------------- */
 
@@ -222,7 +225,7 @@ export default function WizardPage() {
     }
 
     try {
-      const res = await fetch(`/api/chem/ghs?cid=${encodeURIComponent(cid)}`);
+      const res = await fetch(`/api/chem/ghs?cid=${encodeURIComponent(cid)}`, { cache: "no-store" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data?.error) throw new Error(data?.error ?? "Failed to fetch GHS");
 
@@ -497,38 +500,55 @@ export default function WizardPage() {
                     </div>
 
                     <div className="miniCard">
-                      <div className="miniTitle">GHS</div>
-                      <div className="miniLine">
-                        <span className="miniKey">Signal</span>
-                        <span className="miniVal">{ghs?.signalWord ?? "—"}</span>
-                      </div>
-                      <div className="miniLine">
-                        <span className="miniKey">Pictograms</span>
-                        <span className="miniVal">{ghs?.pictograms?.length ? ghs.pictograms.join(", ") : "—"}</span>
-                      </div>
-                      <div className="miniFoot">
-                        {ghs?.hazardStatements?.length ? (
-                          <div className="muted">
-                            {ghs.hazardStatements.slice(0, 4).map((h, i) => (
-                              <div key={i} className="bullet">
-                                • {h}
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="muted">Hazard statements: —</span>
-                        )}
-                      </div>
-                      <div className="miniFoot">
-                        {ghs?.source ? (
-                          <a className="link" href={ghs.source} target="_blank" rel="noreferrer">
-                            Source: PubChem
-                          </a>
-                        ) : (
-                          <span className="muted">Source: —</span>
-                        )}
-                      </div>
-                    </div>
+  <div className="miniTitle">GHS</div>
+
+  {/* Signal */}
+  <div className="miniLine">
+    <span className="miniKey">Signal</span>
+    <span className="miniVal">{ghs?.signalWord ?? "—"}</span>
+  </div>
+
+{/* Pictograms */}
+<div className="miniLine">
+  <span className="miniKey">Pictograms</span>
+
+  {ghs?.pictograms?.length && ghs?.pictogramUrls ? (
+    <div className="pictos">
+      {ghs.pictograms.map((p) => (
+        <img
+          key={p}
+          className="pictoImg"
+          src={ghs.pictogramUrls?.[p] ?? ""}
+          alt={p}
+          title={p}
+        />
+      ))}
+    </div>
+  ) : (
+    <span className="miniVal">—</span>
+  )}
+</div>
+
+
+  {/* Hazard statements */}
+  <div className="miniFoot">
+    {ghs?.hazardStatements?.length ? (
+      <div className="muted">
+        {ghs.hazardStatements.slice(0, 4).map((h, i) => (
+          <div key={i} className="bullet">
+            • {h}
+          </div>
+        ))}
+      </div>
+    ) : (
+      <span className="muted">Hazard statements: —</span>
+    )}
+  </div>
+</div>
+
+
+
+                  
                   </div>
                 </div>
               );
@@ -635,6 +655,25 @@ export default function WizardPage() {
           --shadow: 0 10px 30px rgba(2, 6, 23, 0.12);
           --radius: 16px;
         }
+        
+/* --- GHS pictograms layout --- */
+.pictos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end; /* keeps them aligned like your values */
+}
+
+.pictoImg {
+  width: 34px;      /* tweak: 28–40 looks good */
+  height: 34px;
+  object-fit: contain;
+  display: block;
+  flex: 0 0 auto;
+}
+
+
 
         body {
           background: #f6f7fb;
@@ -941,6 +980,7 @@ export default function WizardPage() {
           gap: 10px;
           padding: 4px 0;
           font-size: 13px;
+          align-items: center;
         }
 
         .miniKey {
@@ -1035,7 +1075,10 @@ export default function WizardPage() {
           .table {
             min-width: 900px;
           }
-        }
+        .pictos { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; }
+        .pictoImg { width:56px; height:56px; display:block; }
+    
+      }
       `}</style>
     </main>
   );
