@@ -40,6 +40,16 @@ type GhsData = {
 };
 
 
+type ConfirmedChem = {
+  name: string;
+  confirmedCid: number;
+  properties?: ChemicalProperties | null;
+};
+
+
+
+
+
 
 /* ------------------------- Helper functions ----------------------- */
 
@@ -105,6 +115,48 @@ export default function WizardPage() {
   const [procedure, setProcedure] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  async function downloadRaPdf() {
+  setError(null);
+
+  const chemList: string[] = analysis?.chemicals ?? [];
+
+  const confirmed: ConfirmedChem[] = chemList
+    .filter((name) => !!chemStates[name]?.confirmedCid)
+    .map((name) => ({
+      name,
+      confirmedCid: Number(chemStates[name]!.confirmedCid),
+      properties: properties[name] ?? null,
+    }));
+
+  if (!confirmed.length) {
+    setError("Confirm at least one chemical first.");
+    return;
+  }
+
+  const res = await fetch("/api/ra/chem2006", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chemicals: confirmed }),
+  });
+
+  if (!res.ok) {
+  const text = await res.text().catch(() => "");
+  throw new Error(text || `RA export failed (${res.status})`);
+}
+
+
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "CHEM2006_RA_autofill.pdf";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [chemStates, setChemStates] = useState<Record<string, ChemState>>({});
@@ -277,6 +329,7 @@ export default function WizardPage() {
         flash: p ? displayTemp(p.flashPoint, unitSystem) : "—",
         melting: p ? displayTemp(p.meltingOrFreezingPoint, unitSystem) : "—",
         ghs: shortGhs(g),
+        g,
       };
     });
   }, [analysis, chemStates, properties, ghsData, unitSystem]);
@@ -586,6 +639,8 @@ export default function WizardPage() {
         ) : null}
       </section>
 
+
+
       {/* Step 4 */}
       <section className="card">
         <div className="cardHead">
@@ -596,6 +651,27 @@ export default function WizardPage() {
               Auto-fills properties + GHS summary. Students fill controls/PPE/risk rating.
             </p>
           </div>
+          <div className="actions">
+            <button
+              className="btn"
+              onClick={downloadRaPdf}
+              disabled={!analysis?.chemicals?.length}
+
+            >
+              Download RA (PDF)
+            </button>
+
+            <button
+              className="btn btnGhost"
+              onClick={() => setShowTable((s) => !s)}
+              
+             >
+              {showTable ? "Collapse" : "Expand"}
+            </button>
+          </div>  
+
+
+
 
           <button className="btn btnGhost" onClick={() => setShowTable((s) => !s)} disabled={!analysis}>
             {showTable ? "Collapse" : "Expand"}
@@ -626,7 +702,24 @@ export default function WizardPage() {
                     <td>{r.boiling}</td>
                     <td>{r.flash}</td>
                     <td>{r.melting}</td>
-                    <td className="tdWide">{r.ghs}</td>
+                    <td className="tdWide">
+  {r.g?.pictograms?.length && r.g?.pictogramUrls ? (
+    <div className="raGhs">
+      <div className="raPictos">
+        {r.g.pictograms.map((p) => (
+          <img key={p} className="raPictoImg" src={r.g!.pictogramUrls![p]} alt={p} title={p} />
+        ))}
+      </div>
+      <div className="raGhsText">{r.ghs}</div>
+    </div>
+  ) : (
+    r.ghs
+  )}
+</td>
+
+
+
+
                     <td className="tdMuted">e.g., fume hood, PPE, spill kit, no ignition sources…</td>
                   </tr>
                 ))}
@@ -673,6 +766,31 @@ export default function WizardPage() {
   flex: 0 0 auto;
 }
 
+.raGhs {
+  display: grid;
+  gap: 6px;
+}
+
+.raPictos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.raPictoImg {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  display: block;
+}
+
+.raGhsText {
+  line-height: 1.35;
+}
+
+
+          
 
 
         body {
