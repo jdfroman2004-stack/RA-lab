@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /* ----------------------------- Types ----------------------------- */
 
@@ -39,17 +39,25 @@ type GhsData = {
   source: string;
 };
 
-
 type ConfirmedChem = {
   name: string;
   confirmedCid: number;
+  quantity?: string | null;
   properties?: ChemicalProperties | null;
 };
 
+type SavedSession = {
+  savedAt: number;
+  procedure: string;
+  analysis: AnalysisResult | null;
+  chemStates: Record<string, ChemState>;
+  properties: Record<string, ChemicalProperties>;
+  ghsData: Record<string, GhsData>;
+  quantities: Record<string, string>;
+};
 
-
-
-
+const SESSION_KEY = "ra-lab-session-v1";
+const PDF_MAX_ROWS = 12; // CHEM2006 template has chem00..chem11
 
 /* ------------------------- Helper functions ----------------------- */
 
@@ -68,6 +76,10 @@ function displayTemp(value: string | null | undefined, unit: UnitSystem) {
   if (!value) return "—";
   if (unit === "metric" && /F/i.test(value)) return convertTempToMetric(value);
   return value;
+}
+
+function sdsSearchUrl(name: string) {
+  return `https://www.google.com/search?q=${encodeURIComponent(`"${name}" safety data sheet SDS`)}`;
 }
 
 function operationHazards(ops: string[]) {
@@ -115,68 +127,88 @@ export default function WizardPage() {
   const [procedure, setProcedure] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  async function downloadRaPdf() {
-  setError(null);
-
-  const chemList: string[] = analysis?.chemicals ?? [];
-
-  const confirmed: ConfirmedChem[] = chemList
-    .filter((name) => !!chemStates[name]?.confirmedCid)
-    .map((name) => ({
-      name,
-      confirmedCid: Number(chemStates[name]!.confirmedCid),
-      properties: properties[name] ?? null,
-    }));
-
-  if (!confirmed.length) {
-    setError("Confirm at least one chemical first.");
-    return;
-  }
-
-  const res = await fetch("/api/ra/chem2006", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chemicals: confirmed }),
-  });
-
-  if (!res.ok) {
-  const text = await res.text().catch(() => "");
-  throw new Error(text || `RA export failed (${res.status})`);
-}
-
-
-  const blob = await res.blob();
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "CHEM2006_RA_autofill.pdf";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  window.URL.revokeObjectURL(url);
-}
-
+  const [notice, setNotice] = useState<string | null>(null);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [chemStates, setChemStates] = useState<Record<string, ChemState>>({});
   const [properties, setProperties] = useState<Record<string, ChemicalProperties>>({});
   const [ghsData, setGhsData] = useState<Record<string, GhsData>>({});
+  const [quantities, setQuantities] = useState<Record<string, string>>({});
+  const [busyChems, setBusyChems] = useState<Record<string, boolean>>({});
   const [unitSystem, setUnitSystem] = useState<UnitSystem>("metric");
 
   const [showChemicals, setShowChemicals] = useState(true);
   const [showOps, setShowOps] = useState(true);
   const [showTable, setShowTable] = useState(true);
 
+  const [restoreAvailable, setRestoreAvailable] = useState<SavedSession | null>(null);
+  const hydrated = useRef(false);
+
+  /* ---------------------- Session persistence ---------------------- */
+  // Auto-saves work to this browser so an accidental refresh doesn't wipe
+  // a half-finished risk assessment. Nothing leaves the user's machine.
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(SESSION_KEY);
+      if (raw) {
+        const saved: SavedSession = JSON.parse(raw);
+        if (saved?.procedure || saved?.analysis) setRestoreAvailable(saved);
+      }
+    } catch {
+      /* corrupt session — ignore */
+    }
+    hydrated.current = true;
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated.current) return;
+    if (!procedure && !analysis) return; // nothing worth saving
+    const session: SavedSession = {
+      savedAt: Date.now(),
+      procedure,
+      analysis,
+      chemStates,
+      properties,
+      ghsData,
+      quantities,
+    };
+    try {
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    } catch {
+      /* storage full/blocked — non-fatal */
+    }
+  }, [procedure, analysis, chemStates, properties, ghsData, quantities]);
+
+  function restoreSession() {
+    if (!restoreAvailable) return;
+    setProcedure(restoreAvailable.procedure || "");
+    setAnalysis(restoreAvailable.analysis || null);
+    setChemStates(restoreAvailable.chemStates || {});
+    setProperties(restoreAvailable.properties || {});
+    setGhsData(restoreAvailable.ghsData || {});
+    setQuantities(restoreAvailable.quantities || {});
+    setRestoreAvailable(null);
+  }
+
+  function dismissSession() {
+    setRestoreAvailable(null);
+    try {
+      window.localStorage.removeItem(SESSION_KEY);
+    } catch {}
+  }
+
   /* ------------------------- AI Parse ------------------------- */
 
   async function analyseProcedure() {
     setLoading(true);
     setError(null);
+    setNotice(null);
     setAnalysis(null);
     setChemStates({});
     setProperties({});
     setGhsData({});
+    setQuantities({});
 
     try {
       const res = await fetch("/api/ai/parse-procedure", {
@@ -199,6 +231,15 @@ export default function WizardPage() {
       const chemicals: string[] = Array.isArray(data?.chemicals) ? data.chemicals : [];
       const operations: string[] = Array.isArray(data?.operations) ? data.operations : [];
 
+      // Quantities come straight from the AI extraction (amount/unit/concentration)
+      const qtys: Record<string, string> = {};
+      if (Array.isArray(data?.chemicalsDetailed)) {
+        for (const c of data.chemicalsDetailed) {
+          if (c?.name && c?.quantity) qtys[c.name] = String(c.quantity);
+        }
+      }
+      setQuantities(qtys);
+
       setAnalysis({ chemicals, operations });
 
       const init: Record<string, ChemState> = {};
@@ -210,6 +251,10 @@ export default function WizardPage() {
       setShowChemicals(true);
       setShowOps(true);
       setShowTable(true);
+
+      // Auto-search PubChem for every chemical in parallel and preselect the
+      // top match, so the student only has to review + confirm.
+      await Promise.allSettled(chemicals.map((c) => findMatches(c)));
     } catch (e: any) {
       setError(e.message ?? "AI request failed");
     } finally {
@@ -220,89 +265,166 @@ export default function WizardPage() {
   /* ------------------------- PubChem ------------------------- */
 
   async function findMatches(name: string) {
-  setError(null);
-  try {
-    const res = await fetch(`/api/chem/search?q=${encodeURIComponent(name)}`);
-    const data = await res.json().catch(() => ({}));
+    try {
+      const res = await fetch(`/api/chem/search?q=${encodeURIComponent(name)}`);
+      const data = await res.json().catch(() => ({}));
 
-    // ✅ Your API returns { matches: [...] }
-    const matches: PubChemMatch[] = Array.isArray(data?.matches) ? data.matches : [];
+      const matches: PubChemMatch[] = Array.isArray(data?.matches) ? data.matches : [];
 
-    setChemStates((prev) => ({
-      ...prev,
-      [name]: {
-        ...prev[name],
-        matches,
-        selectedCid: matches?.[0]?.cid ?? null,
-      },
-    }));
-  } catch (e: any) {
-    setError(e.message ?? "Match lookup failed");
+      setChemStates((prev) => ({
+        ...prev,
+        [name]: {
+          ...prev[name],
+          name,
+          matches,
+          selectedCid: matches?.[0]?.cid ?? null,
+          confirmedCid: prev[name]?.confirmedCid ?? null,
+        },
+      }));
+    } catch (e: any) {
+      setError(e.message ?? "Match lookup failed");
+    }
   }
-}
 
+  /**
+   * One round-trip fetches properties + GHS together via /api/chem/summary.
+   */
+  async function fetchSummary(name: string, cidOverride?: number) {
+    const cid = cidOverride ?? chemStates[name]?.confirmedCid;
+    if (!cid) {
+      setError(`Confirm CID first for "${name}".`);
+      return;
+    }
 
+    setBusyChems((prev) => ({ ...prev, [name]: true }));
+    try {
+      const res = await fetch(`/api/chem/summary?cid=${encodeURIComponent(cid)}`, {
+        cache: "no-store",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.error) throw new Error(data?.error ?? "Failed to fetch chemical data");
+
+      if (data?.properties) {
+        setProperties((prev) => ({ ...prev, [name]: data.properties }));
+      }
+      if (data?.ghs) {
+        setGhsData((prev) => ({ ...prev, [name]: data.ghs }));
+      } else {
+        // Compound has no GHS section on PubChem — clear stale data if any
+        setGhsData((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+      }
+    } catch (e: any) {
+      setError(e.message ?? "Data fetch failed");
+    } finally {
+      setBusyChems((prev) => ({ ...prev, [name]: false }));
+    }
+  }
+
+  /** Confirming a CID immediately fetches its data — no extra clicks. */
   function confirmCid(name: string) {
+    const cid = chemStates[name]?.selectedCid;
+    if (!cid) return;
     setChemStates((prev) => ({
       ...prev,
-      [name]: { ...prev[name], confirmedCid: prev[name].selectedCid },
+      [name]: { ...prev[name], confirmedCid: cid },
     }));
+    void fetchSummary(name, cid);
   }
 
-  async function fetchProperties(name: string) {
-    setError(null);
-    const cid = chemStates[name]?.confirmedCid;
-    if (!cid) {
-      setError(`Confirm CID first for "${name}".`);
+  /** Confirm every chemical that has a suggested match, then fetch all data. */
+  async function confirmAllSuggested() {
+    const chems = analysis?.chemicals ?? [];
+    const targets = chems.filter(
+      (c) => chemStates[c]?.selectedCid && !chemStates[c]?.confirmedCid
+    );
+    if (!targets.length) {
+      setNotice("Nothing to confirm — every chemical is either confirmed or has no match yet.");
       return;
     }
 
-    try {
-      const res = await fetch(`/api/chem/properties?cid=${encodeURIComponent(cid)}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data?.error) throw new Error(data?.error ?? "Failed to fetch properties");
+    setChemStates((prev) => {
+      const next = { ...prev };
+      for (const c of targets) {
+        next[c] = { ...next[c], confirmedCid: next[c].selectedCid };
+      }
+      return next;
+    });
 
-      setProperties((prev) => ({ ...prev, [name]: data }));
-    } catch (e: any) {
-      setError(e.message ?? "Property fetch failed");
+    // Sequential keeps PubChem rate limits happy
+    for (const c of targets) {
+      await fetchSummary(c, chemStates[c].selectedCid!);
     }
-  }
-
-  async function fetchGhs(name: string) {
-    setError(null);
-    const cid = chemStates[name]?.confirmedCid;
-    if (!cid) {
-      setError(`Confirm CID first for "${name}".`);
-      return;
-    }
-
-    try {
-      const res = await fetch(`/api/chem/ghs?cid=${encodeURIComponent(cid)}`, { cache: "no-store" });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data?.error) throw new Error(data?.error ?? "Failed to fetch GHS");
-
-      setGhsData((prev) => ({ ...prev, [name]: data }));
-    } catch (e: any) {
-      setError(e.message ?? "GHS fetch failed");
-    }
-  }
-
-  async function fetchAllForChem(name: string) {
-    await Promise.all([fetchProperties(name), fetchGhs(name)]);
   }
 
   async function fetchAllChemicals() {
     if (!analysis?.chemicals?.length) return;
-    // Only fetch for confirmed CIDs, to avoid wrong picks
     const confirmed = analysis.chemicals.filter((c) => !!chemStates[c]?.confirmedCid);
     if (!confirmed.length) {
       setError("Confirm at least one CID first, then use Fetch all.");
       return;
     }
     for (const c of confirmed) {
-      // sequential keeps it calmer on rate limits
-      // (and avoids PubChem throttling)
-      await fetchAllForChem(c);
+      await fetchSummary(c);
+    }
+  }
+
+  /* ------------------------- PDF export ------------------------- */
+
+  async function downloadRaPdf() {
+    setError(null);
+    setNotice(null);
+
+    const chemList: string[] = analysis?.chemicals ?? [];
+
+    const confirmed: ConfirmedChem[] = chemList
+      .filter((name) => !!chemStates[name]?.confirmedCid)
+      .map((name) => ({
+        name,
+        confirmedCid: Number(chemStates[name]!.confirmedCid),
+        quantity: quantities[name] ?? null,
+        properties: properties[name] ?? null,
+      }));
+
+    if (!confirmed.length) {
+      setError("Confirm at least one chemical first.");
+      return;
+    }
+
+    if (confirmed.length > PDF_MAX_ROWS) {
+      setNotice(
+        `Heads up: the CHEM2006 form fits ${PDF_MAX_ROWS} chemicals. ` +
+          `${confirmed.length - PDF_MAX_ROWS} won't fit and will be left off: ` +
+          confirmed.slice(PDF_MAX_ROWS).map((c) => c.name).join(", ")
+      );
+    }
+
+    try {
+      const res = await fetch("/api/ra/chem2006", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chemicals: confirmed }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `RA export failed (${res.status})`);
+      }
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "CHEM2006_RA_autofill.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setError(e.message ?? "RA export failed");
     }
   }
 
@@ -315,6 +437,12 @@ export default function WizardPage() {
 
   const unitLabel = unitSystem === "metric" ? "Metric (°C)" : "Imperial (°F)";
 
+  const confirmedCount = useMemo(
+    () =>
+      (analysis?.chemicals ?? []).filter((c) => !!chemStates[c]?.confirmedCid).length,
+    [analysis, chemStates]
+  );
+
   const tableRows = useMemo(() => {
     const chems = analysis?.chemicals ?? [];
     return chems.map((c) => {
@@ -325,6 +453,7 @@ export default function WizardPage() {
       return {
         chemical: c,
         cid,
+        quantity: quantities[c] ?? "—",
         boiling: p ? displayTemp(p.boilingPoint, unitSystem) : "—",
         flash: p ? displayTemp(p.flashPoint, unitSystem) : "—",
         melting: p ? displayTemp(p.meltingOrFreezingPoint, unitSystem) : "—",
@@ -332,7 +461,7 @@ export default function WizardPage() {
         g,
       };
     });
-  }, [analysis, chemStates, properties, ghsData, unitSystem]);
+  }, [analysis, chemStates, properties, ghsData, quantities, unitSystem]);
 
   /* ------------------------- Render ------------------------- */
 
@@ -362,10 +491,36 @@ export default function WizardPage() {
         </div>
       </header>
 
+      {restoreAvailable && (
+        <div className="restoreBar">
+          <span>
+            You have unsaved work from{" "}
+            {new Date(restoreAvailable.savedAt).toLocaleString()} — restore it?
+          </span>
+          <div className="restoreBtns">
+            <button className="btn btnPrimary" onClick={restoreSession}>
+              Restore session
+            </button>
+            <button className="btn btnGhost" onClick={dismissSession}>
+              Start fresh
+            </button>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="alert">
           <div className="alertTitle">Something went wrong</div>
           <pre className="alertBody">{error}</pre>
+        </div>
+      )}
+
+      {notice && (
+        <div className="noticeBar">
+          <div className="noticeBody">{notice}</div>
+          <button className="btn btnGhost" onClick={() => setNotice(null)}>
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -376,7 +531,8 @@ export default function WizardPage() {
             <div className="step">Step 1</div>
             <h2 className="cardTitle">Paste procedure</h2>
             <p className="muted">
-              Paste a lab method (paragraphs are best). We’ll extract likely chemicals + operations.
+              Paste a lab method (paragraphs are best). We’ll extract likely chemicals + operations,
+              then automatically look up PubChem matches for each.
             </p>
           </div>
 
@@ -410,7 +566,8 @@ export default function WizardPage() {
             <div className="step">Step 2</div>
             <h2 className="cardTitle">Review chemicals</h2>
             <p className="muted">
-              Confirm the correct PubChem match (CID). This prevents “wrong picks”.
+              Top PubChem matches are pre-selected. Check each one is the right compound, then confirm —
+              properties + GHS load automatically on confirm.
             </p>
           </div>
 
@@ -423,12 +580,20 @@ export default function WizardPage() {
               {showChemicals ? "Collapse" : "Expand"}
             </button>
             <button
+              className={`btn btnPrimary`}
+              onClick={confirmAllSuggested}
+              disabled={!analysis || !analysis?.chemicals?.length}
+              title="Confirm the pre-selected match for every chemical and fetch all data"
+            >
+              Confirm all suggested
+            </button>
+            <button
               className={`btn btnSecondary`}
               onClick={fetchAllChemicals}
-              disabled={!analysis || !(analysis?.chemicals?.length)}
-              title="Fetch properties + GHS for confirmed chemicals"
+              disabled={!analysis || !confirmedCount}
+              title="Re-fetch properties + GHS for confirmed chemicals"
             >
-              Fetch all (confirmed)
+              Refresh all data
             </button>
           </div>
         </div>
@@ -444,30 +609,40 @@ export default function WizardPage() {
               const confirmed = st?.confirmedCid;
               const props = properties[c];
               const ghs = ghsData[c];
+              const busy = !!busyChems[c];
 
               return (
                 <div key={c} className="chemCard">
                   <div className="chemTop">
                     <div>
                       <div className="chemName">{c}</div>
-                      {confirmed ? (
-                        <span className="chip chipOk">Confirmed CID {confirmed}</span>
-                      ) : (
-                        <span className="chip chipWarn">Not confirmed</span>
-                      )}
+                      <div className="chipRow">
+                        {confirmed ? (
+                          <span className="chip chipOk">Confirmed CID {confirmed}</span>
+                        ) : st?.matches?.length ? (
+                          <span className="chip chipWarn">Suggested — please confirm</span>
+                        ) : (
+                          <span className="chip chipWarn">No match yet</span>
+                        )}
+                        {quantities[c] ? (
+                          <span className="chip chipQty" title="Quantity extracted from your procedure">
+                            {quantities[c]}
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
 
                     <div className="chemBtns">
                       <button className="btn btnGhost" onClick={() => findMatches(c)}>
-                        Find matches
+                        Re-search
                       </button>
                       <button
-                        className={`btn ${st?.selectedCid ? "btnPrimary" : "btnDisabled"}`}
+                        className={`btn ${st?.selectedCid && !busy ? "btnPrimary" : "btnDisabled"}`}
                         onClick={() => confirmCid(c)}
-                        disabled={!st?.selectedCid}
+                        disabled={!st?.selectedCid || busy}
                         title={!st?.selectedCid ? "Select a match first" : ""}
                       >
-                        Confirm
+                        {busy ? "Loading…" : confirmed ? "Re-confirm" : "Confirm"}
                       </button>
                     </div>
                   </div>
@@ -486,7 +661,7 @@ export default function WizardPage() {
                       disabled={!st?.matches?.length}
                     >
                       {!st?.matches?.length ? (
-                        <option value="">(Click “Find matches”)</option>
+                        <option value="">(Searching… or click “Re-search”)</option>
                       ) : (
                         st.matches.map((m) => (
                           <option key={m.cid} value={m.cid}>
@@ -495,33 +670,6 @@ export default function WizardPage() {
                         ))
                       )}
                     </select>
-                  </div>
-
-                  <div className="chemActionRow">
-                    <button
-                      className={`btn btnSecondary`}
-                      onClick={() => fetchProperties(c)}
-                      disabled={!confirmed}
-                      title={!confirmed ? "Confirm CID first" : ""}
-                    >
-                      Get properties
-                    </button>
-                    <button
-                      className={`btn btnSecondary`}
-                      onClick={() => fetchGhs(c)}
-                      disabled={!confirmed}
-                      title={!confirmed ? "Confirm CID first" : ""}
-                    >
-                      Get GHS
-                    </button>
-                    <button
-                      className={`btn btnGhost`}
-                      onClick={() => fetchAllForChem(c)}
-                      disabled={!confirmed}
-                      title={!confirmed ? "Confirm CID first" : ""}
-                    >
-                      Get both
-                    </button>
                   </div>
 
                   <div className="twoCol">
@@ -553,55 +701,62 @@ export default function WizardPage() {
                     </div>
 
                     <div className="miniCard">
-  <div className="miniTitle">GHS</div>
+                      <div className="miniTitle">GHS</div>
 
-  {/* Signal */}
-  <div className="miniLine">
-    <span className="miniKey">Signal</span>
-    <span className="miniVal">{ghs?.signalWord ?? "—"}</span>
-  </div>
+                      <div className="miniLine">
+                        <span className="miniKey">Signal</span>
+                        <span className="miniVal">{ghs?.signalWord ?? "—"}</span>
+                      </div>
 
-{/* Pictograms */}
-<div className="miniLine">
-  <span className="miniKey">Pictograms</span>
+                      <div className="miniLine">
+                        <span className="miniKey">Pictograms</span>
 
-  {ghs?.pictograms?.length && ghs?.pictogramUrls ? (
-    <div className="pictos">
-      {ghs.pictograms.map((p) => (
-        <img
-          key={p}
-          className="pictoImg"
-          src={ghs.pictogramUrls?.[p] ?? ""}
-          alt={p}
-          title={p}
-        />
-      ))}
-    </div>
-  ) : (
-    <span className="miniVal">—</span>
-  )}
-</div>
+                        {ghs?.pictograms?.length && ghs?.pictogramUrls ? (
+                          <div className="pictos">
+                            {ghs.pictograms.map((p) => (
+                              <img
+                                key={p}
+                                className="pictoImg"
+                                src={ghs.pictogramUrls?.[p] ?? ""}
+                                alt={p}
+                                title={p}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="miniVal">—</span>
+                        )}
+                      </div>
 
-
-  {/* Hazard statements */}
-  <div className="miniFoot">
-    {ghs?.hazardStatements?.length ? (
-      <div className="muted">
-        {ghs.hazardStatements.slice(0, 4).map((h, i) => (
-          <div key={i} className="bullet">
-            • {h}
-          </div>
-        ))}
-      </div>
-    ) : (
-      <span className="muted">Hazard statements: —</span>
-    )}
-  </div>
-</div>
-
-
-
-                  
+                      <div className="miniFoot">
+                        {ghs?.hazardStatements?.length ? (
+                          <div className="muted">
+                            {ghs.hazardStatements.slice(0, 4).map((h, i) => (
+                              <div key={i} className="bullet">
+                                • {h}
+                              </div>
+                            ))}
+                            {ghs.hazardStatements.length > 4 ? (
+                              <div className="bullet muted">
+                                …plus {ghs.hazardStatements.length - 4} more (see PubChem)
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <span className="muted">Hazard statements: —</span>
+                        )}
+                        <div className="sdsRow">
+                          {ghs?.source ? (
+                            <a className="link" href={ghs.source} target="_blank" rel="noreferrer">
+                              GHS source
+                            </a>
+                          ) : null}
+                          <a className="link" href={sdsSearchUrl(c)} target="_blank" rel="noreferrer">
+                            Find SDS ↗
+                          </a>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               );
@@ -639,8 +794,6 @@ export default function WizardPage() {
         ) : null}
       </section>
 
-
-
       {/* Step 4 */}
       <section className="card">
         <div className="cardHead">
@@ -648,34 +801,22 @@ export default function WizardPage() {
             <div className="step">Step 4</div>
             <h2 className="cardTitle">Draft RA table</h2>
             <p className="muted">
-              Auto-fills properties + GHS summary. Students fill controls/PPE/risk rating.
+              Auto-fills quantities, properties + GHS summary. Students fill controls/PPE/risk rating.
             </p>
           </div>
-          <div className="actions">
+          <div className="headActions">
             <button
-              className="btn"
+              className={`btn ${confirmedCount ? "btnPrimary" : "btnDisabled"}`}
               onClick={downloadRaPdf}
-              disabled={!analysis?.chemicals?.length}
-
+              disabled={!confirmedCount}
+              title={!confirmedCount ? "Confirm at least one chemical first" : ""}
             >
               Download RA (PDF)
             </button>
-
-            <button
-              className="btn btnGhost"
-              onClick={() => setShowTable((s) => !s)}
-              
-             >
+            <button className="btn btnGhost" onClick={() => setShowTable((s) => !s)} disabled={!analysis}>
               {showTable ? "Collapse" : "Expand"}
             </button>
-          </div>  
-
-
-
-
-          <button className="btn btnGhost" onClick={() => setShowTable((s) => !s)} disabled={!analysis}>
-            {showTable ? "Collapse" : "Expand"}
-          </button>
+          </div>
         </div>
 
         {!analysis ? (
@@ -686,6 +827,7 @@ export default function WizardPage() {
               <thead>
                 <tr>
                   <th>Chemical</th>
+                  <th>Quantity</th>
                   <th>Confirmed CID</th>
                   <th>Boiling</th>
                   <th>Flash</th>
@@ -698,34 +840,31 @@ export default function WizardPage() {
                 {tableRows.map((r) => (
                   <tr key={r.chemical}>
                     <td className="tdStrong">{r.chemical}</td>
+                    <td>{r.quantity}</td>
                     <td>{r.cid ?? "—"}</td>
                     <td>{r.boiling}</td>
                     <td>{r.flash}</td>
                     <td>{r.melting}</td>
                     <td className="tdWide">
-  {r.g?.pictograms?.length && r.g?.pictogramUrls ? (
-    <div className="raGhs">
-      <div className="raPictos">
-        {r.g.pictograms.map((p) => (
-          <img key={p} className="raPictoImg" src={r.g!.pictogramUrls![p]} alt={p} title={p} />
-        ))}
-      </div>
-      <div className="raGhsText">{r.ghs}</div>
-    </div>
-  ) : (
-    r.ghs
-  )}
-</td>
-
-
-
-
+                      {r.g?.pictograms?.length && r.g?.pictogramUrls ? (
+                        <div className="raGhs">
+                          <div className="raPictos">
+                            {r.g.pictograms.map((p) => (
+                              <img key={p} className="raPictoImg" src={r.g!.pictogramUrls![p]} alt={p} title={p} />
+                            ))}
+                          </div>
+                          <div className="raGhsText">{r.ghs}</div>
+                        </div>
+                      ) : (
+                        r.ghs
+                      )}
+                    </td>
                     <td className="tdMuted">e.g., fume hood, PPE, spill kit, no ignition sources…</td>
                   </tr>
                 ))}
                 {!tableRows.length && (
                   <tr>
-                    <td colSpan={7} className="tdMuted">
+                    <td colSpan={8} className="tdMuted">
                       No data yet.
                     </td>
                   </tr>
@@ -748,50 +887,46 @@ export default function WizardPage() {
           --shadow: 0 10px 30px rgba(2, 6, 23, 0.12);
           --radius: 16px;
         }
-        
-/* --- GHS pictograms layout --- */
-.pictos {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  justify-content: flex-end; /* keeps them aligned like your values */
-}
 
-.pictoImg {
-  width: 34px;      /* tweak: 28–40 looks good */
-  height: 34px;
-  object-fit: contain;
-  display: block;
-  flex: 0 0 auto;
-}
+        /* --- GHS pictograms layout --- */
+        .pictos {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+          justify-content: flex-end;
+        }
 
-.raGhs {
-  display: grid;
-  gap: 6px;
-}
+        .pictoImg {
+          width: 34px;
+          height: 34px;
+          object-fit: contain;
+          display: block;
+          flex: 0 0 auto;
+        }
 
-.raPictos {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
+        .raGhs {
+          display: grid;
+          gap: 6px;
+        }
 
-.raPictoImg {
-  width: 18px;
-  height: 18px;
-  object-fit: contain;
-  display: block;
-}
+        .raPictos {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          align-items: center;
+        }
 
-.raGhsText {
-  line-height: 1.35;
-}
+        .raPictoImg {
+          width: 18px;
+          height: 18px;
+          object-fit: contain;
+          display: block;
+        }
 
-
-          
-
+        .raGhsText {
+          line-height: 1.35;
+        }
 
         body {
           background: #f6f7fb;
@@ -999,6 +1134,47 @@ export default function WizardPage() {
           font-size: 13px;
         }
 
+        .noticeBar {
+          background: #fffbeb;
+          border: 1px solid #fcd34d;
+          border-radius: 14px;
+          padding: 12px 12px;
+          margin: 12px 0;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .noticeBody {
+          color: #92400e;
+          font-weight: 650;
+          font-size: 13px;
+          line-height: 1.45;
+        }
+
+        .restoreBar {
+          background: #eff6ff;
+          border: 1px solid #bfdbfe;
+          border-radius: 14px;
+          padding: 12px 12px;
+          margin: 12px 0;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+          font-size: 14px;
+          color: #1e3a8a;
+          font-weight: 650;
+        }
+
+        .restoreBtns {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
         .empty {
           padding: 10px 0 0;
           color: rgba(2, 6, 23, 0.62);
@@ -1032,6 +1208,12 @@ export default function WizardPage() {
           margin-bottom: 6px;
         }
 
+        .chipRow {
+          display: flex;
+          gap: 6px;
+          flex-wrap: wrap;
+        }
+
         .chip {
           display: inline-block;
           padding: 5px 10px;
@@ -1052,6 +1234,12 @@ export default function WizardPage() {
           border: 1px solid rgba(245, 158, 11, 0.25);
         }
 
+        .chipQty {
+          background: rgba(59, 130, 246, 0.12);
+          color: rgb(29, 78, 216);
+          border: 1px solid rgba(59, 130, 246, 0.25);
+        }
+
         .chemBtns {
           display: flex;
           gap: 8px;
@@ -1063,13 +1251,6 @@ export default function WizardPage() {
           margin-top: 10px;
           display: grid;
           gap: 6px;
-        }
-
-        .chemActionRow {
-          display: flex;
-          gap: 8px;
-          flex-wrap: wrap;
-          margin-top: 10px;
         }
 
         .twoCol {
@@ -1115,6 +1296,13 @@ export default function WizardPage() {
           font-size: 12px;
         }
 
+        .sdsRow {
+          display: flex;
+          gap: 12px;
+          margin-top: 6px;
+          flex-wrap: wrap;
+        }
+
         .bullet {
           margin: 2px 0;
         }
@@ -1140,7 +1328,7 @@ export default function WizardPage() {
         .table {
           width: 100%;
           border-collapse: collapse;
-          min-width: 980px;
+          min-width: 1040px;
         }
 
         .table th {
@@ -1193,10 +1381,7 @@ export default function WizardPage() {
           .table {
             min-width: 900px;
           }
-        .pictos { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; }
-        .pictoImg { width:56px; height:56px; display:block; }
-    
-      }
+        }
       `}</style>
     </main>
   );

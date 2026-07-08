@@ -13,6 +13,7 @@ type ChemicalProperties = {
 type ConfirmedChem = {
   name: string;
   confirmedCid: number;
+  quantity?: string | null;
   properties?: ChemicalProperties;
 };
 
@@ -32,6 +33,11 @@ export async function POST(req: Request) {
     // only confirmed chems
     const confirmed = chemicals.filter((c) => c?.confirmedCid);
 
+    // The CHEM2006 template has 12 rows (chem00..chem11). Anything beyond
+    // that physically cannot fit — report it instead of silently dropping.
+    const maxRows = 12;
+    const omitted = confirmed.slice(maxRows).map((c) => c.name);
+
     const templatePath = path.join(process.cwd(), "public", "templates", "CHEM2006_Risk_Assessment_Form.pdf");
     const templateBytes = await fs.readFile(templatePath);
 
@@ -44,37 +50,39 @@ export async function POST(req: Request) {
     form.updateFieldAppearances(font);
 
     // ===== Fill PHYSICAL PROPERTIES TABLE via FORM FIELDS =====
-    // Your form uses: chem00, quant00, melting00, boiling00, flash00, cleanup00 ... up to 11
-    const maxRows = 12; // you have 00..11
+    // Form fields: chem00, quant00, melting00, boiling00, flash00, cleanup00 ... up to 11
+    const setField = (fieldName: string, value: string) => {
+      // Template mismatches shouldn't 500 the whole export — fill what exists.
+      try {
+        form.getTextField(fieldName).setText(value);
+      } catch {
+        console.warn(`PDF field missing in template: ${fieldName}`);
+      }
+    };
+
     confirmed.slice(0, maxRows).forEach((c, i) => {
       const id = pad2(i);
 
       const name = clean(c.name) || "—";
+      const quantity = clean(c.quantity) || ""; // auto-filled from AI extraction
       const melt = clean(c.properties?.meltingOrFreezingPoint) || "—";
       const boil = clean(c.properties?.boilingPoint) || "—";
       const flash = clean(c.properties?.flashPoint) || "—";
 
-      // These will throw if the field doesn't exist, so keep it clean + direct
-      form.getTextField(`chem${id}`).setText(name);
-
-      // leave quantity + cleanup for students (blank)
-      form.getTextField(`quant${id}`).setText("");
-      form.getTextField(`cleanup${id}`).setText("");
-
-      form.getTextField(`melting${id}`).setText(melt);
-      form.getTextField(`boiling${id}`).setText(boil);
-      form.getTextField(`flash${id}`).setText(flash);
+      setField(`chem${id}`, name);
+      setField(`quant${id}`, quantity);
+      setField(`cleanup${id}`, ""); // left for students
+      setField(`melting${id}`, melt);
+      setField(`boiling${id}`, boil);
+      setField(`flash${id}`, flash);
     });
 
-    // Clear any unused rows so old template content doesn’t show
-    for (let i = confirmed.length; i < maxRows; i++) {
+    // Clear any unused rows so old template content doesn't show
+    for (let i = Math.min(confirmed.length, maxRows); i < maxRows; i++) {
       const id = pad2(i);
-      try { form.getTextField(`chem${id}`).setText(""); } catch {}
-      try { form.getTextField(`quant${id}`).setText(""); } catch {}
-      try { form.getTextField(`melting${id}`).setText(""); } catch {}
-      try { form.getTextField(`boiling${id}`).setText(""); } catch {}
-      try { form.getTextField(`flash${id}`).setText(""); } catch {}
-      try { form.getTextField(`cleanup${id}`).setText(""); } catch {}
+      for (const prefix of ["chem", "quant", "melting", "boiling", "flash", "cleanup"]) {
+        setField(`${prefix}${id}`, "");
+      }
     }
 
     // OPTIONAL: Fill waste disposal box if you want (otherwise leave for students)
@@ -92,6 +100,8 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="CHEM2006_RA_autofill.pdf"`,
+        // Client shows a warning when the 12-row template couldn't fit everything
+        "X-Omitted-Chemicals": encodeURIComponent(omitted.join(", ")),
       },
     });
   } catch (e: any) {

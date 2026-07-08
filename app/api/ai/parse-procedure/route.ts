@@ -167,15 +167,53 @@ export async function POST(req: Request) {
       );
     }
 
-    const chemicals = (parsed.chemicals || [])
-  .map((c: any) => {
-    // ✅ If model returned string array:
-    if (typeof c === "string") return c.trim();
-    // ✅ If model returned object array:
-    if (c && typeof c === "object") return String(c.name || "").trim();
-    return "";
-  })
-  .filter(Boolean);
+    // Keep the FULL extraction (name + amount + unit + concentration) — the
+    // model already returns it, so don't throw the quantity data away.
+    type RichChem = {
+      name: string;
+      amount: string | null;
+      unit: string | null;
+      concentration: string | null;
+      quantity: string | null; // pre-formatted for display / PDF fill
+    };
+
+    const seen = new Set<string>();
+    const chemicalsDetailed: RichChem[] = [];
+
+    for (const c of parsed.chemicals || []) {
+      let name = "";
+      let amount: string | null = null;
+      let unit: string | null = null;
+      let concentration: string | null = null;
+
+      if (typeof c === "string") {
+        name = c.trim();
+      } else if (c && typeof c === "object") {
+        name = String(c.name || "").trim();
+        amount = c.amount ? String(c.amount).trim() : null;
+        unit = c.unit ? String(c.unit).trim() : null;
+        concentration = c.concentration ? String(c.concentration).trim() : null;
+      }
+
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const qtyParts: string[] = [];
+      if (amount) qtyParts.push(unit ? `${amount} ${unit}` : amount);
+      if (concentration) qtyParts.push(concentration);
+
+      chemicalsDetailed.push({
+        name,
+        amount,
+        unit,
+        concentration,
+        quantity: qtyParts.length ? qtyParts.join(", ") : null,
+      });
+    }
+
+    const chemicals = chemicalsDetailed.map((c) => c.name);
 
 
     const operations = (parsed.operations || [])
@@ -194,9 +232,9 @@ export async function POST(req: Request) {
 
 
     return NextResponse.json({
-      chemicals: Array.from(new Set(chemicals)),
+      chemicals, // string[] of names (backwards compatible)
+      chemicalsDetailed, // full extraction incl. amount / unit / concentration
       operations: Array.from(new Set(operations)),
-      extracted: parsed,
     });
   } catch (err: any) {
     console.error("Route error:", err);
