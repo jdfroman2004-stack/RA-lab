@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getGhsClassification, getProperties } from "@/lib/pubchem";
+import { checkRateLimit } from "@/lib/protect";
 
 /**
  * GET /api/chem/summary?cid=702
@@ -10,6 +11,14 @@ import { getGhsClassification, getProperties } from "@/lib/pubchem";
  * (ethanol, acetone, HCl...) across students are nearly instant.
  */
 export async function GET(req: Request) {
+  const rl = checkRateLimit(req, { key: "chem", limit: 60, windowMs: 60_000 });
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: `Too many requests — try again in ${rl.retryAfterSeconds}s.` },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSeconds) } }
+    );
+  }
+
   try {
     const url = new URL(req.url);
     const cid = (url.searchParams.get("cid") || "").trim();

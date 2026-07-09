@@ -57,7 +57,25 @@ type SavedSession = {
 };
 
 const SESSION_KEY = "ra-lab-session-v1";
+const ACCESS_KEY = "ra-lab-access-code";
 const PDF_MAX_ROWS = 12; // CHEM2006 template has chem00..chem11
+const MAX_PROCEDURE_CHARS = 8000;
+
+type RaTemplate = "chem2006" | "generic";
+
+function getStoredAccessCode(): string {
+  try {
+    return window.localStorage.getItem(ACCESS_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeAccessCode(code: string) {
+  try {
+    window.localStorage.setItem(ACCESS_KEY, code);
+  } catch {}
+}
 
 /* ------------------------- Helper functions ----------------------- */
 
@@ -141,6 +159,10 @@ export default function WizardPage() {
   const [showOps, setShowOps] = useState(true);
   const [showTable, setShowTable] = useState(true);
 
+  const [raTemplate, setRaTemplate] = useState<RaTemplate>("chem2006");
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+
   const [restoreAvailable, setRestoreAvailable] = useState<SavedSession | null>(null);
   const hydrated = useRef(false);
 
@@ -200,7 +222,40 @@ export default function WizardPage() {
 
   /* ------------------------- AI Parse ------------------------- */
 
-  async function analyseProcedure() {
+  /**
+   * Calls parse-procedure; if the server requires an access code, prompts
+   * once, stores it, and retries.
+   */
+  async function callParseApi(payload: Record<string, unknown>) {
+    const attempt = async () => {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const code = getStoredAccessCode();
+      if (code) headers["x-ra-access-code"] = code;
+      const res = await fetch("/api/ai/parse-procedure", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    };
+
+    let { res, data } = await attempt();
+
+    if (res.status === 401 && data?.accessCodeRequired) {
+      const entered = window.prompt(
+        "This tool needs an access code (it's on the poster, or ask a tutor):"
+      );
+      if (entered && entered.trim()) {
+        storeAccessCode(entered.trim());
+        ({ res, data } = await attempt());
+      }
+    }
+
+    return { res, data };
+  }
+
+  async function runAnalysis(payload: Record<string, unknown>) {
     setLoading(true);
     setError(null);
     setNotice(null);
@@ -211,13 +266,7 @@ export default function WizardPage() {
     setQuantities({});
 
     try {
-      const res = await fetch("/api/ai/parse-procedure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ procedure }),
-      });
-
-      const data = await res.json().catch(() => ({}));
+      const { res, data } = await callParseApi(payload);
 
       if (!res.ok || data?.error) {
         const msg = data?.detail
@@ -230,6 +279,11 @@ export default function WizardPage() {
 
       const chemicals: string[] = Array.isArray(data?.chemicals) ? data.chemicals : [];
       const operations: string[] = Array.isArray(data?.operations) ? data.operations : [];
+
+      // Photo mode: show the transcription so the student can check/edit it
+      if (typeof data?.procedureText === "string" && data.procedureText.trim()) {
+        setProcedure(data.procedureText.trim());
+      }
 
       // Quantities come straight from the AI extraction (amount/unit/concentration)
       const qtys: Record<string, string> = {};
@@ -259,6 +313,54 @@ export default function WizardPage() {
       setError(e.message ?? "AI request failed");
     } finally {
       setLoading(false);
+      setPhotoBusy(false);
+    }
+  }
+
+  function analyseProcedure() {
+    return runAnalysis({ procedure });
+  }
+
+  /** Compress a photo client-side, then analyse it with the vision model. */
+  async function analysePhoto(file: File) {
+    setPhotoBusy(true);
+    setError(null);
+    try {
+      const compressed = await new Promise<{ base64: string; mediaType: string }>(
+        (resolve, reject) => {
+          const img = new Image();
+          const url = URL.createObjectURL(file);
+          img.onload = () => {
+            const MAX = 1600;
+            let { width: w, height: h } = img;
+            if (Math.max(w, h) > MAX) {
+              const s = MAX / Math.max(w, h);
+              w = Math.round(w * s);
+              h = Math.round(h * s);
+            }
+            const cv = document.createElement("canvas");
+            cv.width = w;
+            cv.height = h;
+            cv.getContext("2d")!.drawImage(img, 0, 0, w, h);
+            URL.revokeObjectURL(url);
+            const dataUrl = cv.toDataURL("image/jpeg", 0.85);
+            resolve({ base64: dataUrl.split(",")[1], mediaType: "image/jpeg" });
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error("Could not read that image."));
+          };
+          img.src = url;
+        }
+      );
+
+      await runAnalysis({
+        imageBase64: compressed.base64,
+        imageMediaType: compressed.mediaType,
+      });
+    } catch (e: any) {
+      setError(e.message ?? "Photo analysis failed");
+      setPhotoBusy(false);
     }
   }
 
@@ -394,19 +496,40 @@ export default function WizardPage() {
       return;
     }
 
-    if (confirmed.length > PDF_MAX_ROWS) {
+    if (raTemplate === "chem2006" && confirmed.length > PDF_MAX_ROWS) {
       setNotice(
         `Heads up: the CHEM2006 form fits ${PDF_MAX_ROWS} chemicals. ` +
           `${confirmed.length - PDF_MAX_ROWS} won't fit and will be left off: ` +
-          confirmed.slice(PDF_MAX_ROWS).map((c) => c.name).join(", ")
+          confirmed.slice(PDF_MAX_ROWS).map((c) => c.name).join(", ") +
+          ` — or switch to the Generic template, which fits everything.`
       );
     }
 
     try {
-      const res = await fetch("/api/ra/chem2006", {
+      const endpoint = raTemplate === "chem2006" ? "/api/ra/chem2006" : "/api/ra/generic";
+      const payload =
+        raTemplate === "chem2006"
+          ? { chemicals: confirmed }
+          : {
+              chemicals: confirmed.map((c) => ({
+                ...c,
+                ghs: ghsData[c.name]
+                  ? {
+                      signalWord: ghsData[c.name].signalWord,
+                      pictograms: ghsData[c.name].pictograms,
+                      hazardStatements: ghsData[c.name].hazardStatements,
+                    }
+                  : null,
+              })),
+              operationHazards: operationRisks,
+              unitCode: "",
+              experimentTitle: "",
+            };
+
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chemicals: confirmed }),
+        body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
@@ -418,7 +541,8 @@ export default function WizardPage() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "CHEM2006_RA_autofill.pdf";
+      a.download =
+        raTemplate === "chem2006" ? "CHEM2006_RA_autofill.pdf" : "Risk_Assessment_draft.pdf";
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -529,33 +653,59 @@ export default function WizardPage() {
         <div className="cardHead">
           <div>
             <div className="step">Step 1</div>
-            <h2 className="cardTitle">Paste procedure</h2>
+            <h2 className="cardTitle">Paste procedure — or photograph it</h2>
             <p className="muted">
-              Paste a lab method (paragraphs are best). We’ll extract likely chemicals + operations,
-              then automatically look up PubChem matches for each.
+              Paste a lab method, or snap a photo of the lab manual page. We’ll extract likely
+              chemicals + operations, then automatically look up PubChem matches for each.
             </p>
           </div>
 
-          <button
-            className={`btn ${canAnalyse ? "btnPrimary" : "btnDisabled"}`}
-            onClick={analyseProcedure}
-            disabled={!canAnalyse || loading}
-            title={!canAnalyse ? "Paste a longer procedure first (20+ chars)" : ""}
-          >
-            {loading ? "Analysing…" : "Analyse procedure"}
-          </button>
+          <div className="headActions">
+            <button
+              className="btn btnSecondary"
+              onClick={() => photoInputRef.current?.click()}
+              disabled={loading || photoBusy}
+              title="Snap or upload a photo of the procedure (e.g. lab manual page)"
+            >
+              {photoBusy ? "Reading photo…" : "📷 Photo of procedure"}
+            </button>
+            <input
+              ref={photoInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void analysePhoto(f);
+                e.target.value = "";
+              }}
+            />
+            <button
+              className={`btn ${canAnalyse ? "btnPrimary" : "btnDisabled"}`}
+              onClick={analyseProcedure}
+              disabled={!canAnalyse || loading}
+              title={!canAnalyse ? "Paste a longer procedure first (20+ chars)" : ""}
+            >
+              {loading ? "Analysing…" : "Analyse procedure"}
+            </button>
+          </div>
         </div>
 
         <textarea
           className="textarea"
           rows={10}
+          maxLength={MAX_PROCEDURE_CHARS}
           value={procedure}
           onChange={(e) => setProcedure(e.target.value)}
-          placeholder="Example: Add ethanol (10 mL) to a round-bottom flask. Cool in an ice bath, then add acetic acid dropwise..."
+          placeholder="Example: Add ethanol (10 mL) to a round-bottom flask. Cool in an ice bath, then add acetic acid dropwise... Or use the photo button to snap your lab manual."
         />
 
         <div className="hintRow">
           <span className="pill">Tip: include quantities + key verbs (add, heat, reflux, quench, extract)</span>
+          <span className="pill charCount">
+            {procedure.length.toLocaleString()} / {MAX_PROCEDURE_CHARS.toLocaleString()}
+          </span>
         </div>
       </section>
 
@@ -805,6 +955,15 @@ export default function WizardPage() {
             </p>
           </div>
           <div className="headActions">
+            <select
+              className="select templateSelect"
+              value={raTemplate}
+              onChange={(e) => setRaTemplate(e.target.value as RaTemplate)}
+              title="Which PDF layout to generate"
+            >
+              <option value="chem2006">CHEM2006 form</option>
+              <option value="generic">Generic RA (any unit)</option>
+            </select>
             <button
               className={`btn ${confirmedCount ? "btnPrimary" : "btnDisabled"}`}
               onClick={downloadRaPdf}
@@ -888,7 +1047,6 @@ export default function WizardPage() {
           --radius: 16px;
         }
 
-        /* --- GHS pictograms layout --- */
         .pictos {
           display: flex;
           flex-wrap: wrap;
@@ -1041,8 +1199,19 @@ export default function WizardPage() {
 
         .hintRow {
           display: flex;
-          justify-content: flex-start;
+          justify-content: space-between;
+          gap: 8px;
+          flex-wrap: wrap;
           margin-top: 10px;
+        }
+
+        .charCount {
+          font-variant-numeric: tabular-nums;
+        }
+
+        .templateSelect {
+          width: auto;
+          min-width: 170px;
         }
 
         .pill {
@@ -1380,6 +1549,42 @@ export default function WizardPage() {
           }
           .table {
             min-width: 900px;
+          }
+        }
+
+        /* Phone-first tweaks: QR-code users arrive on mobile */
+        @media (max-width: 640px) {
+          .wrap {
+            margin: 14px auto 40px;
+            padding: 0 12px;
+          }
+          .title {
+            font-size: 26px;
+          }
+          .card {
+            padding: 12px;
+          }
+          .cardHead {
+            flex-direction: column;
+            align-items: stretch;
+          }
+          .headActions {
+            justify-content: stretch;
+          }
+          .headActions .btn,
+          .headActions .select {
+            flex: 1 1 auto;
+          }
+          .chemBtns .btn {
+            padding: 9px 10px;
+            font-size: 13px;
+          }
+          .table {
+            min-width: 720px;
+            font-size: 12px;
+          }
+          .textarea {
+            min-height: 140px;
           }
         }
       `}</style>
